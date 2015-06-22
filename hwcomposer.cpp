@@ -117,6 +117,8 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, 
             &kdisp->ctx->displays[HWC_DISPLAY_PRIMARY] ==
             kdisp ? HWC_DISPLAY_PRIMARY : HWC_DISPLAY_EXTERNAL;
 
+    ALOGI_IF(DEBUG_ST_HWCOMPOSER, "VSYNC");
+
     signal_fences(kdisp->ctx, disp);
 
     if (kdisp->vsync_on) {
@@ -243,16 +245,49 @@ destroy_display(kms_display_t * d)
     close(d->timeline);
 }
 
-static void
-dump_layer(hwc_layer_1_t * l)
+#if DEBUG_ST_HWCOMPOSER
+static const char *
+composition_type_str(int32_t type)
 {
-    ALOGI("Layer type=%d, flags=0x%08x, handle=0x%p, tr=0x%02x, blend=0x%04x,"
-            " {%d,%d,%d,%d} -> {%d,%d,%d,%d}, acquireFd=%d, releaseFd=%d",
-            l->compositionType, l->flags, l->handle, l->transform, l->blending,
-            l->sourceCrop.left, l->sourceCrop.top, l->sourceCrop.right,
-            l->sourceCrop.bottom, l->displayFrame.left, l->displayFrame.top,
-            l->displayFrame.right, l->displayFrame.bottom, l->acquireFenceFd, l->releaseFenceFd);
+    const char *name[] = {
+        "FB      ",
+        "Overlay ",
+        "Backgnd ",
+        "FBTarget",
+        "Sideband",
+        "Cursor  ",
+        "UNKNOWN "
+    };
+
+    if ((type >= HWC_FRAMEBUFFER) && (type <= HWC_CURSOR_OVERLAY))
+        return name[type];
+
+    return name[HWC_CURSOR_OVERLAY + 1];
 }
+
+static void
+dump_layer(hwc_layer_1_t * l, int i)
+{
+    private_handle_t const *hnd = reinterpret_cast < private_handle_t const *>(l->handle);
+
+    ALOGI_IF(DEBUG_ST_HWCOMPOSER,
+            " [%d] %s, flags=0x%02x, handle=%p, fd=%3d, tr=0x%02x, blend=0x%04x,"
+            " {%dx%d @ (%d,%d)} <- {%dx%d @ (%d,%d)}, acqFd=%d",
+            i, composition_type_str(l->compositionType), l->flags,
+            l->handle, hnd ? hnd->share_fd : -1,
+            l->transform, l->blending,
+            l->displayFrame.right - l->displayFrame.left,
+            l->displayFrame.bottom - l->displayFrame.top, l->displayFrame.left, l->displayFrame.top,
+            l->sourceCrop.right - l->sourceCrop.left, l->sourceCrop.bottom - l->sourceCrop.top,
+            l->sourceCrop.left, l->sourceCrop.top, l->acquireFenceFd);
+}
+#else
+static void
+dump_layer(hwc_layer_1_t * l, int i)
+{
+    (void) l, i;
+}
+#endif
 
 static void *
 event_handler(void *arg)
@@ -375,6 +410,8 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
 
     kms_display_t *kdisp = &ctx->displays[disp];
 
+    ALOGI_IF(DEBUG_ST_HWCOMPOSER, "UPDATE (%d layers)", display->numHwLayers);
+
     if (!is_display_connected(ctx, disp))
         return 0;
 
@@ -383,6 +420,8 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
 
         if (!target)
             continue;
+
+        dump_layer(target, (int) i);
 
         private_handle_t const *hnd = reinterpret_cast < private_handle_t const *>(target->handle);
 

@@ -29,6 +29,8 @@
 #include "xf86drm.h"
 #include "xf86drmMode.h"
 
+#define DEBUG_ST_HWCOMPOSER 1
+
 #define HWC_DEFAULT_CONFIG 0
 #define to_ctx(dev) ((hwc_context_t *)dev)
 
