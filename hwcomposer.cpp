@@ -110,6 +110,7 @@ signal_fences(hwc_context_t * ctx, int disp)
 static void
 vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, void *data)
 {
+    (void) fd, frame;
     kms_display_t *kdisp = (kms_display_t *) data;
     const hwc_procs_t *procs = kdisp->ctx->cb_procs;
     int disp =
@@ -229,7 +230,7 @@ init_display(hwc_context_t * ctx, int disp, uint32_t connector_type)
 }
 
 static void
-destroy_display(int drm_fd, kms_display_t * d)
+destroy_display(kms_display_t * d)
 {
     if (d->crtc)
         drmModeFreeCrtc(d->crtc);
@@ -733,6 +734,7 @@ hwc_blank(struct hwc_composer_device_1 *dev, int disp, int blank)
 static void
 hwc_dump(struct hwc_composer_device_1 *dev, char *buff, int buff_len)
 {
+    (void) dev, buff, buff_len;
     ALOGD("%s", __func__);
 }
 
@@ -744,8 +746,8 @@ hwc_device_close(struct hw_device_t *dev)
     if (!ctx)
         return 0;
 
-    destroy_display(ctx->drm_fd, &ctx->displays[HWC_DISPLAY_PRIMARY]);
-    destroy_display(ctx->drm_fd, &ctx->displays[HWC_DISPLAY_EXTERNAL]);
+    destroy_display(&ctx->displays[HWC_DISPLAY_PRIMARY]);
+    destroy_display(&ctx->displays[HWC_DISPLAY_EXTERNAL]);
 
     drmClose(ctx->drm_fd);
     free(ctx);
