@@ -38,7 +38,8 @@
 
 #define FENCE_DELAY 2
 
-typedef struct kms_display {
+typedef struct kms_display
+{
     drmModeConnectorPtr con;
     drmModeEncoderPtr enc;
     drmModeCrtcPtr crtc;
@@ -53,7 +54,8 @@ typedef struct kms_display {
     unsigned signaled_fences;
 } kms_display_t;
 
-typedef struct hwc_context {
+typedef struct hwc_context
+{
     hwc_composer_device_1_t device;
     pthread_mutex_t ctx_mutex;
     const hwc_procs_t *cb_procs;
@@ -71,7 +73,7 @@ typedef struct hwc_context {
     int32_t ydpi;
     int32_t vsync_period;
 
-    /* drm planes management*/
+    /* drm planes management */
     uint64_t used_planes;
 } hwc_context_t;
 

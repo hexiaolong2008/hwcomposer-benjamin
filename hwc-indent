@@ -14,10 +14,12 @@ $INDENT \
   --no-tabs \
   --cuddle-else \
   --dont-line-up-parentheses \
-  --continuation-indentation4 \
+  --continuation-indentation8 \
   --honour-newlines \
   --tab-size8 \
   --indent-level4 \
   --leave-preprocessor-space \
+  --no-space-after-function-call-names \
+  --line-length100 \
   $* || exit $?
 done
