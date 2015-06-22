@@ -30,6 +30,7 @@
 #include "xf86drmMode.h"
 
 #define DEBUG_ST_HWCOMPOSER 1
+#define DEBUG_ST_HWCOMPOSER_FENCE 0
 
 #define HWC_DEFAULT_CONFIG 0
 #define to_ctx(dev) ((hwc_context_t *)dev)
@@ -78,11 +79,24 @@ enum
     PT_PENDING
 };
 
+#if DEBUG_ST_HWCOMPOSER_FENCE
+typedef struct timeline_dbg
+{
+    int status;
+    unsigned value;
+} timeline_dbg_t;
+
+#define DBG_MAX_PT 10
+#endif /* DEBUG_ST_HWCOMPOSER_FENCE */
+
 typedef struct timeline_info
 {
     int timeline;
     pthread_mutex_t lock;       /* protect signaled_fences */
     unsigned signaled_fences;
+#if DEBUG_ST_HWCOMPOSER_FENCE
+    timeline_dbg_t dbg_status[DBG_MAX_PT];
+#endif                          /* DEBUG_ST_HWCOMPOSER_FENCE */
 } timeline_info_t;
 
 typedef struct kms_display

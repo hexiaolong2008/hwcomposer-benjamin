@@ -74,6 +74,79 @@ static const struct hwc_connector connector_list[] = {
     CONN_STR_AND_INT(eDP)
 };
 
+#if DEBUG_ST_HWCOMPOSER_FENCE
+static void
+dbg_timeline_dump(timeline_info_t * timeline, int plane_index)
+{
+    int i;
+    char dump_str[255], ref[32], val[32];
+
+    strcpy(dump_str, "   { ");
+    if (plane_index >= 0)
+        sprintf(ref, "plane%d", plane_index);
+    else
+        sprintf(ref, "compo ");
+
+    strcat(dump_str, ref);
+    strcat(dump_str, " = [");
+
+    for (i = 0; i < DBG_MAX_PT; i++) {
+        if (timeline->dbg_status[i].status == PT_PENDING) {
+            sprintf(val, " %d", timeline->dbg_status[i].value);
+            strcat(dump_str, val);
+        }
+    }
+
+    strcat(dump_str, "] }");
+
+    ALOGI(dump_str);
+}
+
+static void
+dbg_timeline_insert(timeline_info_t * timeline, unsigned value)
+{
+    int i;
+
+    for (i = 0; i < DBG_MAX_PT; i++) {
+        if ((timeline->dbg_status[i].status == PT_PENDING) &&
+                (timeline->dbg_status[i].value == value))
+            return;
+    }
+
+    for (i = 0; i < DBG_MAX_PT; i++) {
+        if (timeline->dbg_status[i].status == PT_FREE)
+            break;
+    }
+
+    if (i == DBG_MAX_PT) {
+        ALOGE("   { Timeline full! }");
+        return;
+    }
+
+    timeline->dbg_status[i].status = PT_PENDING;
+    timeline->dbg_status[i].value = value;
+}
+
+static void
+dbg_timeline_remove(timeline_info_t * timeline, unsigned value)
+{
+    int i;
+
+    for (i = 0; i < DBG_MAX_PT; i++) {
+        if ((timeline->dbg_status[i].value == value) &&
+                (timeline->dbg_status[i].status == PT_PENDING))
+            break;
+    }
+
+    if (i == DBG_MAX_PT) {
+        ALOGE("   { Timeline : cannot find %d }", value);
+        return;
+    }
+
+    timeline->dbg_status[i].status = PT_FREE;
+}
+#endif
+
 static void
 release_drm_fb(int fd, fb_info_t * fb_info)
 {
@@ -113,18 +186,30 @@ send_vblank_request(hwc_context_t * ctx, int disp)
 }
 
 static void
-signal_fence(timeline_info_t * timeline)
+signal_fence(timeline_info_t * timeline, int plane_index)
 {
     pthread_mutex_lock(&timeline->lock);
 
     sw_sync_timeline_inc(timeline->timeline, 1);
     timeline->signaled_fences++;
 
+#if DEBUG_ST_HWCOMPOSER_FENCE
+
+    if (plane_index >= 0)
+        ALOGI("   { pt! : plane%d @ %d }", plane_index, timeline->signaled_fences);
+    else
+        ALOGI("   { pt! : compo  @ %d }", timeline->signaled_fences);
+
+    dbg_timeline_remove(timeline, timeline->signaled_fences);
+#else
+    (void) plane_index;
+#endif
+
     pthread_mutex_unlock(&timeline->lock);
 }
 
 static int
-create_fence(timeline_info_t * timeline, unsigned relative)
+create_fence(timeline_info_t * timeline, unsigned relative, int plane_index)
 {
     int fd;
     unsigned new_pt;
@@ -133,6 +218,17 @@ create_fence(timeline_info_t * timeline, unsigned relative)
 
     new_pt = timeline->signaled_fences + relative;
     fd = sw_sync_fence_create(timeline->timeline, "Fence", new_pt);
+
+#if DEBUG_ST_HWCOMPOSER_FENCE
+    if (plane_index >= 0)
+        ALOGI("   { pt+ : plane%d @ %d }", plane_index, new_pt);
+    else
+        ALOGI("   { pt+ : compo  @ %d }", new_pt);
+
+    dbg_timeline_insert(timeline, new_pt);
+#else
+    (void) plane_index;
+#endif
 
     pthread_mutex_unlock(&timeline->lock);
 
@@ -169,7 +265,7 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, 
                 continue;
 
             /* The buffer actually changed: increment timeline */
-            signal_fence(&kdisp->release_sync[i]);
+            signal_fence(&kdisp->release_sync[i], i);
             release_drm_fb(kdisp->ctx->drm_fd, &fb_status->current);
 
             fb_status->next.updated = false;
@@ -191,9 +287,14 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, 
 
     /* Signal retireFence */
     if (kdisp->compo_updated) {
-        signal_fence(&kdisp->retire_sync);
+        signal_fence(&kdisp->retire_sync, -1);
         kdisp->compo_updated = false;
     }
+#if DEBUG_ST_HWCOMPOSER_FENCE
+    dbg_timeline_dump(&kdisp->retire_sync, -1);
+    for (i = 0; i < (int) kdisp->ctx->nb_planes; i++)
+        dbg_timeline_dump(&kdisp->release_sync[i], i);
+#endif
 }
 
 static int
@@ -615,7 +716,7 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
 
                 if (target->releaseFenceFd == -1)
                     target->releaseFenceFd = create_fence(&kdisp->release_sync[plane_index],
-                            is_fb_updated ? FENCE_NEW_BUF : FENCE_CURRENT_BUF);
+                            is_fb_updated ? FENCE_NEW_BUF : FENCE_CURRENT_BUF, plane_index);
 
                 break;
 
@@ -653,7 +754,7 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
     }
 
     if (display->retireFenceFd == -1)
-        display->retireFenceFd = create_fence(&kdisp->retire_sync, FENCE_NEW_BUF);
+        display->retireFenceFd = create_fence(&kdisp->retire_sync, FENCE_NEW_BUF, -1);
 
     kdisp->compo_updated = true;
 
