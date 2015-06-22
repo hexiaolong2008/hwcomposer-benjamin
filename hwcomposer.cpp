@@ -74,10 +74,25 @@ static const struct hwc_connector connector_list[] = {
     CONN_STR_AND_INT(eDP)
 };
 
-static int
-send_vsync_request(hwc_context_t * ctx, int disp)
+static void
+release_drm_fb(int fd, fb_info_t * fb_info)
 {
-    int ret = 0;
+    struct drm_mode_destroy_dumb destroy_arg;
+
+    if (fb_info->drm_fb_id)
+        drmModeRmFB(fd, fb_info->drm_fb_id);
+
+    if (fb_info->bo_handle) {
+        memset(&destroy_arg, 0, sizeof(destroy_arg));
+        destroy_arg.handle = fb_info->bo_handle;
+        drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_arg);
+    }
+}
+
+static int
+send_vblank_request(hwc_context_t * ctx, int disp)
+{
+    int ret;
 
     drmVBlank vbl;
 
@@ -92,19 +107,36 @@ send_vsync_request(hwc_context_t * ctx, int disp)
 
     ret = drmWaitVBlank(ctx->drm_fd, &vbl);
     if (ret < 0)
-        ALOGE("Failed to request vsync %d", errno);
+        ALOGE("Failed to request vblank %d", errno);
 
     return ret;
 }
 
 static void
-signal_fences(hwc_context_t * ctx, int disp)
+signal_fence(timeline_info_t * timeline)
 {
-    kms_display_t *kdisp = &ctx->displays[disp];
+    pthread_mutex_lock(&timeline->lock);
 
-    /* signal timeline point */
-    sw_sync_timeline_inc(kdisp->timeline, 1);
-    kdisp->signaled_fences++;
+    sw_sync_timeline_inc(timeline->timeline, 1);
+    timeline->signaled_fences++;
+
+    pthread_mutex_unlock(&timeline->lock);
+}
+
+static int
+create_fence(timeline_info_t * timeline, unsigned relative)
+{
+    int fd;
+    unsigned new_pt;
+
+    pthread_mutex_lock(&timeline->lock);
+
+    new_pt = timeline->signaled_fences + relative;
+    fd = sw_sync_fence_create(timeline->timeline, "Fence", new_pt);
+
+    pthread_mutex_unlock(&timeline->lock);
+
+    return fd;
 }
 
 static void
@@ -113,22 +145,55 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, 
     (void) fd, frame;
     kms_display_t *kdisp = (kms_display_t *) data;
     const hwc_procs_t *procs = kdisp->ctx->cb_procs;
+    int i;
+    fb_status_t *fb_status;
     int disp =
             &kdisp->ctx->displays[HWC_DISPLAY_PRIMARY] ==
             kdisp ? HWC_DISPLAY_PRIMARY : HWC_DISPLAY_EXTERNAL;
 
     ALOGI_IF(DEBUG_ST_HWCOMPOSER, "VSYNC");
 
-    signal_fences(kdisp->ctx, disp);
+    /* Restart the vblank request  */
+    send_vblank_request(kdisp->ctx, disp);
 
-    if (kdisp->vsync_on) {
-        int64_t ts = sec * (int64_t) 1000000000 + usec * (int64_t) 1000;
+    /* Call the vsync callback if requested */
+    if (kdisp->vsync_on)
+        procs->vsync(procs, disp, sec * (int64_t) 1000000000 + usec * (int64_t) 1000);
 
-        procs->vsync(procs, disp, ts);
+    /* For each overlay: signal the release_fences and free resources */
+    for (i = 0; i < MAX_DRM_PLANES; i++) {
+        fb_status = &kdisp->fb_plane[i];
+        if (fb_status->next.updated) {
+            if (fb_status->current.drm_fb_id == fb_status->next.drm_fb_id)
+                /* shall not happen, but more secure to check */
+                continue;
+
+            /* The buffer actually changed: increment timeline */
+            signal_fence(&kdisp->release_sync[i]);
+            release_drm_fb(kdisp->ctx->drm_fd, &fb_status->current);
+
+            fb_status->next.updated = false;
+            fb_status->current = fb_status->next;
+        }
     }
 
-    /* request next VSYNC */
-    send_vsync_request(kdisp->ctx, disp);
+    /* For main FB : free resources */
+    fb_status = &kdisp->fb_main;
+    if (fb_status->next.updated) {
+        if (fb_status->current.drm_fb_id != fb_status->next.drm_fb_id) {
+            /* shall always be true, but more secure to check */
+            release_drm_fb(kdisp->ctx->drm_fd, &fb_status->current);
+
+            fb_status->next.updated = false;
+            fb_status->current = fb_status->next;
+        }
+    }
+
+    /* Signal retireFence */
+    if (kdisp->compo_updated) {
+        signal_fence(&kdisp->retire_sync);
+        kdisp->compo_updated = false;
+    }
 }
 
 static int
@@ -215,8 +280,16 @@ init_display(hwc_context_t * ctx, int disp, uint32_t connector_type)
     drmModeFreeResources(resources);
 
     /* sync init */
-    d->timeline = sw_sync_timeline_create();
-    d->signaled_fences = 0;
+    d->retire_sync.timeline = sw_sync_timeline_create();
+    d->retire_sync.signaled_fences = 0;
+    pthread_mutex_init(&d->retire_sync.lock, (const pthread_mutexattr_t *) NULL);
+
+    for (i = 0; i < MAX_DRM_PLANES; i++) {
+        d->release_sync[i].timeline = sw_sync_timeline_create();
+        d->release_sync[i].signaled_fences = 0;
+        pthread_mutex_init(&d->release_sync[i].lock, (const pthread_mutexattr_t *) NULL);
+    }
+
     d->vsync_on = 0;
 
     return 0;
@@ -234,6 +307,8 @@ init_display(hwc_context_t * ctx, int disp, uint32_t connector_type)
 static void
 destroy_display(kms_display_t * d)
 {
+    int i;
+
     if (d->crtc)
         drmModeFreeCrtc(d->crtc);
     if (d->enc)
@@ -242,7 +317,9 @@ destroy_display(kms_display_t * d)
         drmModeFreeConnector(d->con);
     memset(d, 0, sizeof(*d));
 
-    close(d->timeline);
+    for (i = 0; i < MAX_DRM_PLANES; i++)
+        close(d->release_sync[i].timeline);
+    close(d->retire_sync.timeline);
 }
 
 #if DEBUG_ST_HWCOMPOSER
@@ -270,8 +347,7 @@ dump_layer(hwc_layer_1_t * l, int i)
 {
     private_handle_t const *hnd = reinterpret_cast < private_handle_t const *>(l->handle);
 
-    ALOGI_IF(DEBUG_ST_HWCOMPOSER,
-            " [%d] %s, flags=0x%02x, handle=%p, fd=%3d, tr=0x%02x, blend=0x%04x,"
+    ALOGI(" [%d] %s, flags=0x%02x, handle=%p, fd=%3d, tr=0x%02x, blend=0x%04x,"
             " {%dx%d @ (%d,%d)} <- {%dx%d @ (%d,%d)}, acqFd=%d",
             i, composition_type_str(l->compositionType), l->flags,
             l->handle, hnd ? hnd->share_fd : -1,
@@ -311,9 +387,9 @@ event_handler(void *arg)
     // This is further explained in graphics.h.
     setpriority(PRIO_PROCESS, 0, HAL_PRIORITY_URGENT_DISPLAY);
 
-    /* request a first VSYNC */
-    send_vsync_request(ctx, HWC_DISPLAY_PRIMARY);
-    send_vsync_request(ctx, HWC_DISPLAY_EXTERNAL);
+    /* start asking for VBLANK */
+    send_vblank_request(ctx, HWC_DISPLAY_PRIMARY);
+    send_vblank_request(ctx, HWC_DISPLAY_EXTERNAL);
 
     while (1) {
         int ret = poll(pfds, ARRAY_SIZE(pfds), 60000);
@@ -380,40 +456,45 @@ set_zorder(hwc_context_t * ctx, int plane_id, int zorder)
     return ! !ret;
 }
 
-static void
-set_release_fences(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display)
+static int
+get_plane_index(hwc_context_t * ctx, uint32_t drm_plane_id)
 {
-    kms_display_t *kdisp = &ctx->displays[disp];
-    int fence;
+    unsigned int i;
 
-    fence = sw_sync_fence_create(kdisp->timeline, "Fence", kdisp->signaled_fences + FENCE_DELAY);
-
-    for (size_t i = 0; i < display->numHwLayers; i++) {
-        hwc_layer_1_t *target = &display->hwLayers[i];
-        if (target->compositionType == HWC_OVERLAY)
-            target->releaseFenceFd = dup(fence);
+    if (!drm_plane_id) {
+        ALOGE("Invalid plane_id (%d)", drm_plane_id);
+        return -1;
     }
 
-    display->retireFenceFd = fence;
+    for (i = 0; i < MAX_DRM_PLANES; i++) {
+        if (ctx->plane_id[i] == drm_plane_id)
+            return i;
+    }
+
+    ALOGE("Unknown plane_id (%d)", drm_plane_id);
+    return -1;
 }
 
 static int
 update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display)
 {
-    int ret = 0, zorder = 1;
+    int ret = 0, zorder = 1, drm_plane_id = 0, plane_index = 0;
+    unsigned int fourcc;
     uint32_t width = 0, height = 0;
     uint32_t fb = 0;
     uint32_t bo[4] = { 0 };
     uint32_t pitch[4] = { 0 };
     uint32_t offset[4] = { 0 };
+    uint64_t used_planes = 0;
     hwc_layer_1_t *target = NULL;
-
+    fb_status_t *fb_status;
+    bool is_fb_updated;
     kms_display_t *kdisp = &ctx->displays[disp];
-
-    ALOGI_IF(DEBUG_ST_HWCOMPOSER, "UPDATE (%d layers)", display->numHwLayers);
 
     if (!is_display_connected(ctx, disp))
         return 0;
+
+    ALOGI_IF(DEBUG_ST_HWCOMPOSER, "UPDATE (%d layers)", display->numHwLayers);
 
     for (size_t i = 0; i < display->numHwLayers; i++) {
         hwc_layer_1_t *target = &display->hwLayers[i];
@@ -428,8 +509,8 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
         if (!hnd)
             continue;
 
-        if ((display->hwLayers[i].compositionType != HWC_FRAMEBUFFER_TARGET)
-                && (display->hwLayers[i].compositionType != HWC_OVERLAY))
+        if ((target->compositionType != HWC_FRAMEBUFFER_TARGET)
+                && (target->compositionType != HWC_OVERLAY))
             continue;
 
         /* wait for sync */
@@ -443,65 +524,139 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
             target->acquireFenceFd = -1;
         }
 
-        unsigned int fourcc = hnd_to_fourcc(hnd);
-
-        if (!fourcc)
-            return -EINVAL;
-
         if (!(hnd->flags & private_handle_t::PRIV_FLAGS_USES_ION)) {
-            AERR("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
+            ALOGE("private_handle_t isn't using ION, hnd->flags %d", hnd->flags);
             return -EINVAL;
         }
 
-        width = hnd->width;
-        height = hnd->height;
-
-        ret = drmPrimeFDToHandle(ctx->drm_fd, hnd->share_fd, &bo[0]);
-        if (ret) {
-            ALOGE("Failed to get fd for DUMB buffer %s", strerror(errno));
-            return ret;
-        }
-
-        if (fourcc == DRM_FORMAT_NV12) {
-            bo[1] = bo[0];
-            pitch[0] = width;
-            pitch[1] = width;
-            offset[1] = width * height;
+        if (target->compositionType == HWC_FRAMEBUFFER_TARGET) {
+            fb_status = &kdisp->fb_main;
         } else {
-            pitch[0] = width * 4;       //stride
+            drm_plane_id = hnd->plane_id;
+            plane_index = get_plane_index(ctx, drm_plane_id);
+            fb_status = &kdisp->fb_plane[plane_index];
         }
 
-        ret = drmModeAddFB2(ctx->drm_fd, width, height, fourcc, bo, pitch, offset, &fb, 0);
-        if (ret) {
-            ALOGE("cannot create framebuffer (%d): %s", errno, strerror(errno));
-            return ret;
+        /* Check if the layer provides with an updated buffer */
+        is_fb_updated = (fb_status->current.share_fd != hnd->share_fd);
+
+        /* Create a drm fb if needed */
+        if (is_fb_updated) {
+            fourcc = hnd_to_fourcc(hnd);
+            if (!fourcc)
+                return -EINVAL;
+
+            width = hnd->width;
+            height = hnd->height;
+
+            ret = drmPrimeFDToHandle(ctx->drm_fd, hnd->share_fd, &bo[0]);
+            if (ret) {
+                ALOGE("Failed to get fd for DUMB buffer %s", strerror(errno));
+                return ret;
+            }
+
+            if (fourcc == DRM_FORMAT_NV12) {
+                bo[1] = bo[0];
+                pitch[0] = width;
+                pitch[1] = width;
+                offset[1] = width * height;
+            } else {
+                pitch[0] = width * 4;   //stride
+            }
+
+            ret = drmModeAddFB2(ctx->drm_fd, width, height, fourcc, bo, pitch, offset, &fb, 0);
+            if (ret) {
+                ALOGE("cannot create framebuffer (%d): %s", errno, strerror(errno));
+                return ret;
+            }
+
+            ALOGI_IF(DEBUG_ST_HWCOMPOSER, "  Created DRM fb (dmafd=%d)", hnd->share_fd);
+
+        } else {
+            fb = fb_status->current.drm_fb_id;
         }
 
-        if (display->hwLayers[i].compositionType == HWC_FRAMEBUFFER_TARGET) {
-            drmModeSetCrtc(ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
-                    &kdisp->con->connector_id, 1, kdisp->mode);
-            zorder++;
+        switch (target->compositionType) {
+            case HWC_FRAMEBUFFER_TARGET:
+                ret = drmModeSetCrtc(ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
+                        &kdisp->con->connector_id, 1, kdisp->mode);
+
+                if (ret) {
+                    ALOGE("  drmModeSetCrtc failed (%d)", errno);
+                    return ret;
+                }
+
+                zorder++;
+
+                ALOGI_IF(DEBUG_ST_HWCOMPOSER, "  Called drmModeSetCrtc (%s buffer)",
+                        is_fb_updated ? "updated" : "unchanged");
+                break;
+
+            case HWC_OVERLAY:
+                set_zorder(ctx, drm_plane_id, zorder++);
+
+                ret = drmModeSetPlane(ctx->drm_fd, drm_plane_id, kdisp->crtc_id, fb, 0,
+                        target->displayFrame.left, target->displayFrame.top,
+                        target->displayFrame.right - target->displayFrame.left,
+                        target->displayFrame.bottom - target->displayFrame.top,
+                        target->sourceCrop.left << 16, target->sourceCrop.top << 16,
+                        (target->sourceCrop.right - target->sourceCrop.left) << 16,
+                        (target->sourceCrop.bottom - target->sourceCrop.top) << 16);
+
+                if (ret) {
+                    ALOGE("  drmModeSetPlane failed (%d)", errno);
+                    return ret;
+                }
+
+                used_planes |= 1 << plane_index;
+
+                ALOGI_IF(DEBUG_ST_HWCOMPOSER, "  Called drmModeSetPlane (%s buffer)",
+                        is_fb_updated ? "updated" : "unchanged");
+
+                if (target->releaseFenceFd == -1)
+                    target->releaseFenceFd = create_fence(&kdisp->release_sync[plane_index],
+                            is_fb_updated ? FENCE_NEW_BUF : FENCE_CURRENT_BUF);
+
+                break;
+
+            default:
+                ALOGE("Unknwown type %d", target->compositionType);
+                break;
         }
 
-        if (display->hwLayers[i].compositionType == HWC_OVERLAY) {
-            int plane_id = hnd->plane_id;
-
-            set_zorder(ctx, plane_id, zorder++);
-
-            drmModeSetPlane(ctx->drm_fd, plane_id, kdisp->crtc_id, fb, 0,
-                    target->displayFrame.left,
-                    target->displayFrame.top,
-                    target->displayFrame.right - target->displayFrame.left,
-                    target->displayFrame.bottom - target->displayFrame.top,
-                    target->sourceCrop.left << 16,
-                    target->sourceCrop.top << 16,
-                    (target->sourceCrop.right - target->sourceCrop.left) << 16,
-                    (target->sourceCrop.bottom - target->sourceCrop.top) << 16);
-
-        }
+        fb_status->next.drm_fb_id = fb;
+        fb_status->next.bo_handle = bo[0];
+        fb_status->next.share_fd = hnd->share_fd;
+        fb_status->next.updated = is_fb_updated;
     }
 
-    set_release_fences(ctx, disp, display);
+    /* Look for freshly disabled planes */
+    for (unsigned int i = 0; i < ctx->nb_planes; i++) {
+        fb_status = &kdisp->fb_plane[i];
+        if (!(used_planes & 1) && fb_status->current.drm_fb_id) {
+            ALOGI_IF(DEBUG_ST_HWCOMPOSER, "Disabling plane %d", ctx->plane_id[i]);
+
+            ret = drmModeSetPlane(ctx->drm_fd, ctx->plane_id[i], kdisp->crtc_id,
+                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0);
+
+            if (ret) {
+                ALOGE("drmModeSetPlane disabling failed (%d)", errno);
+                return ret;
+            }
+
+            fb_status->next.drm_fb_id = 0;
+            fb_status->next.bo_handle = 0;
+            fb_status->next.share_fd = 0;
+            fb_status->next.updated = true;
+        }
+        used_planes >>= 1;
+    }
+
+    if (display->retireFenceFd == -1)
+        display->retireFenceFd = create_fence(&kdisp->retire_sync, FENCE_NEW_BUF);
+
+    kdisp->compo_updated = true;
+
     return 0;
 }
 
@@ -532,19 +687,21 @@ hwc_set(struct hwc_composer_device_1 *dev, size_t numDisplays, hwc_display_conte
 static int
 find_plane(hwc_context_t * ctx, int disp, private_handle_t * hnd)
 {
-    unsigned int i, j, ret = 0;
+    unsigned int i, j, drm_plane_id = 0;
     drmModePlaneResPtr plane_res;
     int drm_fd = ctx->drm_fd;
     unsigned int fourcc = hnd_to_fourcc(hnd);
 
     if (!fourcc) {
         ALOGI("no plane fourcc for handle %08x", intptr_t(hnd));
-        return ret;
+        return drm_plane_id;
     }
 
     plane_res = drmModeGetPlaneResources(drm_fd);
 
-    for (i = 0; i < plane_res->count_planes && !ret; i++) {
+    ctx->nb_planes = MIN(plane_res->count_planes, MAX_DRM_PLANES);
+
+    for (i = 0; i < ctx->nb_planes && !drm_plane_id; i++) {
         drmModePlanePtr plane;
 
         plane = drmModeGetPlane(drm_fd, plane_res->planes[i]);
@@ -562,11 +719,12 @@ find_plane(hwc_context_t * ctx, int disp, private_handle_t * hnd)
             continue;
         }
 
-        for (j = 0; j < plane->count_formats && !ret; j++) {
+        for (j = 0; j < plane->count_formats && !drm_plane_id; j++) {
             if (plane->formats[j] == fourcc) {
-                ret = plane->plane_id;
+                drm_plane_id = plane->plane_id;
                 hnd->plane_id = plane->plane_id;
                 ctx->used_planes |= 1 << i;
+                ctx->plane_id[i] = plane->plane_id;
             }
         }
 
@@ -575,7 +733,7 @@ find_plane(hwc_context_t * ctx, int disp, private_handle_t * hnd)
 
     drmModeFreePlaneResources(plane_res);
 
-    return ret;
+    return drm_plane_id;
 }
 
 static int
@@ -590,7 +748,6 @@ prepare_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * conten
     for (int i = content->numHwLayers - 1; i >= 0; i--) {
         hwc_layer_1_t & layer = content->hwLayers[i];
         private_handle_t *hnd = (private_handle_t *) layer.handle;
-        int plane_id;
 
         if (layer.flags & HWC_SKIP_LAYER)
             continue;
@@ -603,8 +760,7 @@ prepare_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * conten
             continue;
         }
 
-        plane_id = find_plane(ctx, disp, hnd);
-        if (plane_id) {
+        if (find_plane(ctx, disp, hnd)) {
             layer.compositionType = HWC_OVERLAY;
             continue;
         }

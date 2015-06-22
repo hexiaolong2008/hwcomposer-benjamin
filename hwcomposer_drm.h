@@ -34,11 +34,56 @@
 #define HWC_DEFAULT_CONFIG 0
 #define to_ctx(dev) ((hwc_context_t *)dev)
 
+#ifndef MIN
+#define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
+#endif
+
 #ifndef ARRAY_SIZE
 #define ARRAY_SIZE(arr) (sizeof(arr)/sizeof((arr)[0]))
 #endif
 
-#define FENCE_DELAY 2
+/* FENCE_CURRENT_BUF:
+ *  Number of ticks before signaling a fence for a buffer ON DISPLAY:
+ *  After one tick the buffer is replaced by another buffer : it is no more on
+ *  display and has to be signaled.
+ */
+#define FENCE_CURRENT_BUF 1
+
+/* FENCE_NEW_BUF:
+ *  Number of ticks before signaling a fence for a NEW buffer:
+ *  After one tick the buffer gets on display. After a second tick the buffer is
+ *  replaced by another buffer : it is no more on display and has to be signaled.
+ */
+#define FENCE_NEW_BUF 2
+
+#define MAX_DRM_PLANES 10
+
+typedef struct fb_info
+{
+    int share_fd;               /* dmabuf fd */
+    uint32_t drm_fb_id;         /* DRM framebuffer id */
+    uint32_t bo_handle;         /* KMS buffer object handle */
+    bool updated;               /* True if the fb information has been updated */
+} fb_info_t;
+
+typedef struct fb_status
+{
+    fb_info_t current;
+    fb_info_t next;
+} fb_status_t;
+
+enum
+{
+    PT_FREE,
+    PT_PENDING
+};
+
+typedef struct timeline_info
+{
+    int timeline;
+    pthread_mutex_t lock;       /* protect signaled_fences */
+    unsigned signaled_fences;
+} timeline_info_t;
 
 typedef struct kms_display
 {
@@ -52,8 +97,14 @@ typedef struct kms_display
     struct hwc_context *ctx;
 
     /* sync */
-    int timeline;
-    unsigned signaled_fences;
+    timeline_info_t retire_sync;
+    timeline_info_t release_sync[MAX_DRM_PLANES];
+
+    /* fb info */
+    fb_status_t fb_main;
+    fb_status_t fb_plane[MAX_DRM_PLANES];
+
+    bool compo_updated;
 } kms_display_t;
 
 typedef struct hwc_context
@@ -77,6 +128,8 @@ typedef struct hwc_context
 
     /* drm planes management */
     uint64_t used_planes;
+    uint32_t plane_id[MAX_DRM_PLANES];
+    unsigned int nb_planes;
 } hwc_context_t;
 
 #endif //#ifndef ANDROID_HWC_H_
