@@ -29,7 +29,7 @@
 #include "xf86drm.h"
 #include "xf86drmMode.h"
 
-#define DEBUG_ST_HWCOMPOSER 1
+#define DEBUG_ST_HWCOMPOSER 0
 #define DEBUG_ST_HWCOMPOSER_FENCE 0
 
 #define HWC_DEFAULT_CONFIG 0
