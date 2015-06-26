@@ -79,16 +79,24 @@ static void
 dbg_timeline_dump(timeline_info_t * timeline, int plane_index)
 {
     int i;
-    char dump_str[255], ref[32], val[32];
+    char dump_str[255], val[32];
 
-    strcpy(dump_str, "   { ");
-    if (plane_index >= 0)
-        sprintf(ref, "plane%d", plane_index);
-    else
-        sprintf(ref, "compo ");
+    switch (plane_index) {
+        case CURSOR_INDEX:
+            sprintf(dump_str, "   { cursor = [");
+            break;
 
-    strcat(dump_str, ref);
-    strcat(dump_str, " = [");
+        case COMPO_INDEX:
+            sprintf(dump_str, "   { compo  = [");
+            break;
+
+        default:
+            if (plane_index >= 0)
+                sprintf(dump_str, "   { plane%d = [", plane_index);
+            else
+                sprintf(dump_str, "   { ???  %d = [", plane_index);
+            break;
+    }
 
     for (i = 0; i < DBG_MAX_PT; i++) {
         if (timeline->dbg_status[i].status == PT_PENDING) {
@@ -162,6 +170,18 @@ release_drm_fb(int fd, fb_info_t * fb_info)
     }
 }
 
+static void
+release_drm_cursor(int fd, cursor_info_t * cursor_info)
+{
+    struct drm_mode_destroy_dumb destroy_arg;
+
+    if (cursor_info->bo_handle) {
+        memset(&destroy_arg, 0, sizeof(destroy_arg));
+        destroy_arg.handle = cursor_info->bo_handle;
+        drmIoctl(fd, DRM_IOCTL_MODE_DESTROY_DUMB, &destroy_arg);
+    }
+}
+
 static int
 send_vblank_request(hwc_context_t * ctx, int disp)
 {
@@ -194,11 +214,22 @@ signal_fence(timeline_info_t * timeline, int plane_index)
     timeline->signaled_fences++;
 
 #if DEBUG_ST_HWCOMPOSER_FENCE
+    switch (plane_index) {
+        case CURSOR_INDEX:
+            ALOGI("   { pt! : cursor @ %d }", timeline->signaled_fences);
+            break;
 
-    if (plane_index >= 0)
-        ALOGI("   { pt! : plane%d @ %d }", plane_index, timeline->signaled_fences);
-    else
-        ALOGI("   { pt! : compo  @ %d }", timeline->signaled_fences);
+        case COMPO_INDEX:
+            ALOGI("   { pt! : compo  @ %d }", timeline->signaled_fences);
+            break;
+
+        default:
+            if (plane_index >= 0)
+                ALOGI("   { pt! : plane%d @ %d }", plane_index, timeline->signaled_fences);
+            else
+                ALOGI("   { pt! : ???  %d @ %d }", plane_index, timeline->signaled_fences);
+            break;
+    }
 
     dbg_timeline_remove(timeline, timeline->signaled_fences);
 #else
@@ -220,10 +251,22 @@ create_fence(timeline_info_t * timeline, unsigned relative, int plane_index)
     fd = sw_sync_fence_create(timeline->timeline, "Fence", new_pt);
 
 #if DEBUG_ST_HWCOMPOSER_FENCE
-    if (plane_index >= 0)
-        ALOGI("   { pt+ : plane%d @ %d }", plane_index, new_pt);
-    else
-        ALOGI("   { pt+ : compo  @ %d }", new_pt);
+    switch (plane_index) {
+        case CURSOR_INDEX:
+            ALOGI("   { pt+ : cursor @ %d }", new_pt);
+            break;
+
+        case COMPO_INDEX:
+            ALOGI("   { pt+ : compo  @ %d }", new_pt);
+            break;
+
+        default:
+            if (plane_index >= 0)
+                ALOGI("   { pt+ : plane%d @ %d }", plane_index, new_pt);
+            else
+                ALOGI("   { pt+ : ???  %d @ %d }", plane_index, new_pt);
+            break;
+    }
 
     dbg_timeline_insert(timeline, new_pt);
 #else
@@ -243,6 +286,7 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, 
     const hwc_procs_t *procs = kdisp->ctx->cb_procs;
     int i;
     fb_status_t *fb_status;
+    cursor_status_t *cursor_status;
     int disp =
             &kdisp->ctx->displays[HWC_DISPLAY_PRIMARY] ==
             kdisp ? HWC_DISPLAY_PRIMARY : HWC_DISPLAY_EXTERNAL;
@@ -285,15 +329,32 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, 
         }
     }
 
+    /* For cursor: signal the release_fences and free resources */
+    cursor_status = &kdisp->cursor;
+    if (cursor_status->next.updated) {
+        if (cursor_status->current.bo_handle != cursor_status->next.bo_handle) {
+            /* shall always be true, but more secure to check */
+
+            /* The buffer actually changed: increment timeline */
+            signal_fence(&kdisp->release_sync_cursor, CURSOR_INDEX);
+
+            release_drm_cursor(kdisp->ctx->drm_fd, &cursor_status->current);
+
+            cursor_status->next.updated = false;
+            cursor_status->current = cursor_status->next;
+        }
+    }
+
     /* Signal retireFence */
     if (kdisp->compo_updated) {
-        signal_fence(&kdisp->retire_sync, -1);
+        signal_fence(&kdisp->retire_sync, COMPO_INDEX);
         kdisp->compo_updated = false;
     }
 #if DEBUG_ST_HWCOMPOSER_FENCE
-    dbg_timeline_dump(&kdisp->retire_sync, -1);
+    dbg_timeline_dump(&kdisp->retire_sync, COMPO_INDEX);
     for (i = 0; i < (int) kdisp->ctx->nb_planes; i++)
         dbg_timeline_dump(&kdisp->release_sync[i], i);
+    dbg_timeline_dump(&kdisp->release_sync_cursor, CURSOR_INDEX);
 #endif
 }
 
@@ -391,6 +452,13 @@ init_display(hwc_context_t * ctx, int disp, uint32_t connector_type)
         pthread_mutex_init(&d->release_sync[i].lock, (const pthread_mutexattr_t *) NULL);
     }
 
+    if (!drmModeSetCursor(drm_fd, d->crtc_id, 0, 0, 0)) {
+        d->cursor.support = true;
+        d->release_sync_cursor.timeline = sw_sync_timeline_create();
+        d->release_sync_cursor.signaled_fences = 0;
+        pthread_mutex_init(&d->release_sync_cursor.lock, (const pthread_mutexattr_t *) NULL);
+    }
+
     d->vsync_on = 0;
 
     return 0;
@@ -420,7 +488,11 @@ destroy_display(kms_display_t * d)
 
     for (i = 0; i < MAX_DRM_PLANES; i++)
         close(d->release_sync[i].timeline);
+
     close(d->retire_sync.timeline);
+
+    if (d->cursor.support)
+        close(d->release_sync_cursor.timeline);
 }
 
 #if DEBUG_ST_HWCOMPOSER
@@ -564,7 +636,7 @@ get_plane_index(hwc_context_t * ctx, uint32_t drm_plane_id)
 
     if (!drm_plane_id) {
         ALOGE("Invalid plane_id (%d)", drm_plane_id);
-        return -1;
+        return -EINVAL;
     }
 
     for (i = 0; i < MAX_DRM_PLANES; i++) {
@@ -573,23 +645,79 @@ get_plane_index(hwc_context_t * ctx, uint32_t drm_plane_id)
     }
 
     ALOGE("Unknown plane_id (%d)", drm_plane_id);
-    return -1;
+    return -EINVAL;
+}
+
+static int
+create_drm_fb(hwc_context_t * ctx, private_handle_t const *hnd, uint32_t * fb, uint32_t bo[4])
+{
+    int ret;
+    unsigned int fourcc;
+    uint32_t width, height, pitch[4], offset[4] = { 0 };
+
+    ret = drmPrimeFDToHandle(ctx->drm_fd, hnd->share_fd, bo);
+    if (ret) {
+        ALOGE("Failed to get fd for DUMB buffer %s", strerror(errno));
+        return ret;
+    }
+
+    fourcc = hnd_to_fourcc(hnd);
+    if (!fourcc) {
+        ALOGE("unknown pixel format (%d)", hnd->format);
+        return -EINVAL;
+    }
+
+    width = hnd->width;
+    height = hnd->height;
+
+    if (fourcc == DRM_FORMAT_NV12) {
+        bo[1] = bo[0];
+        pitch[0] = width;
+        pitch[1] = width;
+        offset[1] = width * height;
+    } else {
+        pitch[0] = width * 4;   //stride
+    }
+
+    ret = drmModeAddFB2(ctx->drm_fd, width, height, fourcc, bo, pitch, offset, fb, 0);
+    if (ret) {
+        ALOGE("cannot create framebuffer (%d): %s", errno, strerror(errno));
+        return ret;
+    }
+
+    ALOGI_IF(DEBUG_ST_HWCOMPOSER, "  Created DRM fb (dmafd=%d)", hnd->share_fd);
+
+    return 0;
+}
+
+static void
+set_fb_info(fb_info_t * fb_info, uint32_t fb_id, uint32_t bo, int fd, bool updated)
+{
+    fb_info->drm_fb_id = fb_id;
+    fb_info->bo_handle = bo;
+    fb_info->share_fd = fd;
+    fb_info->updated = updated;
+}
+
+static void
+set_cursor_info(cursor_info_t * cursor_info, uint32_t bo, int fd, bool updated)
+{
+    cursor_info->bo_handle = bo;
+    cursor_info->share_fd = fd;
+    cursor_info->updated = updated;
 }
 
 static int
 update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display)
 {
-    int ret = 0, zorder = 1, drm_plane_id = 0, plane_index = 0;
-    unsigned int fourcc;
-    uint32_t width = 0, height = 0;
-    uint32_t fb = 0;
-    uint32_t bo[4] = { 0 };
-    uint32_t pitch[4] = { 0 };
-    uint32_t offset[4] = { 0 };
+    int ret, zorder = 1, drm_plane_id, plane_index;
+    uint32_t fb, bo[4] = { 0 };
     uint64_t used_planes = 0;
-    hwc_layer_1_t *target = NULL;
+    bool used_cursor = false;
+    hwc_layer_1_t *target;
     fb_status_t *fb_status;
-    bool is_fb_updated;
+    cursor_status_t *cursor_status;
+    bool is_fb_updated, is_cursor_updated;
     kms_display_t *kdisp = &ctx->displays[disp];
 
     if (!is_display_connected(ctx, disp))
@@ -598,7 +726,7 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
     ALOGI_IF(DEBUG_ST_HWCOMPOSER, "UPDATE (%d layers)", display->numHwLayers);
 
     for (size_t i = 0; i < display->numHwLayers; i++) {
-        hwc_layer_1_t *target = &display->hwLayers[i];
+        target = &display->hwLayers[i];
 
         if (!target)
             continue;
@@ -610,8 +738,9 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
         if (!hnd)
             continue;
 
-        if ((target->compositionType != HWC_FRAMEBUFFER_TARGET)
-                && (target->compositionType != HWC_OVERLAY))
+        if ((target->compositionType != HWC_FRAMEBUFFER_TARGET) &&
+                (target->compositionType != HWC_OVERLAY) &&
+                (target->compositionType != HWC_CURSOR_OVERLAY))
             continue;
 
         /* wait for sync */
@@ -630,55 +759,23 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
             return -EINVAL;
         }
 
-        if (target->compositionType == HWC_FRAMEBUFFER_TARGET) {
-            fb_status = &kdisp->fb_main;
-        } else {
-            drm_plane_id = hnd->plane_id;
-            plane_index = get_plane_index(ctx, drm_plane_id);
-            fb_status = &kdisp->fb_plane[plane_index];
-        }
-
-        /* Check if the layer provides with an updated buffer */
-        is_fb_updated = (fb_status->current.share_fd != hnd->share_fd);
-
-        /* Create a drm fb if needed */
-        if (is_fb_updated) {
-            fourcc = hnd_to_fourcc(hnd);
-            if (!fourcc)
-                return -EINVAL;
-
-            width = hnd->width;
-            height = hnd->height;
-
-            ret = drmPrimeFDToHandle(ctx->drm_fd, hnd->share_fd, &bo[0]);
-            if (ret) {
-                ALOGE("Failed to get fd for DUMB buffer %s", strerror(errno));
-                return ret;
-            }
-
-            if (fourcc == DRM_FORMAT_NV12) {
-                bo[1] = bo[0];
-                pitch[0] = width;
-                pitch[1] = width;
-                offset[1] = width * height;
-            } else {
-                pitch[0] = width * 4;   //stride
-            }
-
-            ret = drmModeAddFB2(ctx->drm_fd, width, height, fourcc, bo, pitch, offset, &fb, 0);
-            if (ret) {
-                ALOGE("cannot create framebuffer (%d): %s", errno, strerror(errno));
-                return ret;
-            }
-
-            ALOGI_IF(DEBUG_ST_HWCOMPOSER, "  Created DRM fb (dmafd=%d)", hnd->share_fd);
-
-        } else {
-            fb = fb_status->current.drm_fb_id;
-        }
-
+        /* Update display */
         switch (target->compositionType) {
             case HWC_FRAMEBUFFER_TARGET:
+                /* Get resources */
+                fb_status = &kdisp->fb_main;
+
+                is_fb_updated = (fb_status->current.share_fd != hnd->share_fd);
+
+                if (is_fb_updated) {
+                    ret = create_drm_fb(ctx, hnd, &fb, bo);
+                    if (ret)
+                        return ret;
+                } else {
+                    fb = fb_status->current.drm_fb_id;
+                }
+
+                /* Update display */
                 ret = drmModeSetCrtc(ctx->drm_fd, kdisp->crtc_id, fb, 0, 0,
                         &kdisp->con->connector_id, 1, kdisp->mode);
 
@@ -687,13 +784,33 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
                     return ret;
                 }
 
-                zorder++;
-
                 ALOGI_IF(DEBUG_ST_HWCOMPOSER, "  Called drmModeSetCrtc (%s buffer)",
                         is_fb_updated ? "updated" : "unchanged");
+
+                zorder++;
+
+                /* Update status */
+                set_fb_info(&fb_status->next, fb, bo[0], hnd->share_fd, is_fb_updated);
+
                 break;
 
             case HWC_OVERLAY:
+                /* Get resources */
+                drm_plane_id = hnd->plane_id;
+                plane_index = get_plane_index(ctx, drm_plane_id);
+                fb_status = &kdisp->fb_plane[plane_index];
+
+                is_fb_updated = (fb_status->current.share_fd != hnd->share_fd);
+
+                if (is_fb_updated) {
+                    ret = create_drm_fb(ctx, hnd, &fb, bo);
+                    if (ret)
+                        return ret;
+                } else {
+                    fb = fb_status->current.drm_fb_id;
+                }
+
+                /* Update display */
                 set_zorder(ctx, drm_plane_id, zorder++);
 
                 ret = drmModeSetPlane(ctx->drm_fd, drm_plane_id, kdisp->crtc_id, fb, 0,
@@ -714,21 +831,64 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
                 ALOGI_IF(DEBUG_ST_HWCOMPOSER, "  Called drmModeSetPlane (%s buffer)",
                         is_fb_updated ? "updated" : "unchanged");
 
+                /* Set fence to be signaled when the buffer gets out of the screen */
                 if (target->releaseFenceFd == -1)
                     target->releaseFenceFd = create_fence(&kdisp->release_sync[plane_index],
                             is_fb_updated ? FENCE_NEW_BUF : FENCE_CURRENT_BUF, plane_index);
 
+                /* Update status */
+                set_fb_info(&fb_status->next, fb, bo[0], hnd->share_fd, is_fb_updated);
+
+                break;
+
+            case HWC_CURSOR_OVERLAY:
+                /* Get resources */
+                cursor_status = &kdisp->cursor;
+
+                is_cursor_updated = (cursor_status->current.share_fd != hnd->share_fd);
+                if (is_cursor_updated) {
+                    ret = drmPrimeFDToHandle(ctx->drm_fd, hnd->share_fd, bo);
+                    if (ret) {
+                        ALOGE("Failed to get handle for cursor %s", strerror(errno));
+                        return ret;
+                    }
+
+                    ret = drmModeSetCursor(ctx->drm_fd, kdisp->crtc_id, bo[0], hnd->width,
+                            hnd->height);
+                    if (ret) {
+                        ALOGE("Failed to set cursor %s", strerror(errno));
+                        return ret;
+                    }
+                } else {
+                    bo[0] = cursor_status->current.bo_handle;
+                }
+
+                /* Update display */
+                ret = drmModeMoveCursor(ctx->drm_fd, kdisp->crtc_id,
+                        target->displayFrame.left, target->displayFrame.top);
+                if (ret) {
+                    ALOGE("Failed to move cursor %s", strerror(errno));
+                    return ret;
+                }
+
+                ALOGI_IF(DEBUG_ST_HWCOMPOSER, "  Called drmModeMoveCursor (%s buffer)",
+                        is_cursor_updated ? "updated" : "unchanged");
+
+                used_cursor = true;
+
+                /* set fence */
+                if (target->releaseFenceFd == -1)
+                    target->releaseFenceFd = create_fence(&kdisp->release_sync_cursor,
+                            is_cursor_updated ? FENCE_NEW_BUF : FENCE_CURRENT_BUF, CURSOR_INDEX);
+
+                /* Update status */
+                set_cursor_info(&cursor_status->next, bo[0], hnd->share_fd, is_cursor_updated);
+
                 break;
 
             default:
-                ALOGE("Unknwown type %d", target->compositionType);
                 break;
         }
-
-        fb_status->next.drm_fb_id = fb;
-        fb_status->next.bo_handle = bo[0];
-        fb_status->next.share_fd = hnd->share_fd;
-        fb_status->next.updated = is_fb_updated;
     }
 
     /* Look for freshly disabled planes */
@@ -745,16 +905,30 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
                 return ret;
             }
 
-            fb_status->next.drm_fb_id = 0;
-            fb_status->next.bo_handle = 0;
-            fb_status->next.share_fd = 0;
-            fb_status->next.updated = true;
+            /* Update status */
+            set_fb_info(&fb_status->next, 0, 0, 0, true);
         }
         used_planes >>= 1;
     }
 
+    /* Look for freshly disabled cursor */
+    cursor_status = &kdisp->cursor;
+    if (!used_cursor && cursor_status->current.bo_handle) {
+        ALOGI_IF(DEBUG_ST_HWCOMPOSER, "Disabling cursor");
+
+        ret = drmModeSetCursor(ctx->drm_fd, kdisp->crtc_id, 0, 0, 0);
+
+        if (ret) {
+            ALOGE("drmModeSetPlane disabling failed (%d)", errno);
+            return ret;
+        }
+
+        /* Update status */
+        set_cursor_info(&cursor_status->next, 0, 0, true);
+    }
+
     if (display->retireFenceFd == -1)
-        display->retireFenceFd = create_fence(&kdisp->retire_sync, FENCE_NEW_BUF, -1);
+        display->retireFenceFd = create_fence(&kdisp->retire_sync, FENCE_NEW_BUF, COMPO_INDEX);
 
     kdisp->compo_updated = true;
 
@@ -837,18 +1011,25 @@ find_plane(hwc_context_t * ctx, int disp, private_handle_t * hnd)
     return drm_plane_id;
 }
 
+#define MAX_SIZE_CURSOR 64
+
 static int
 prepare_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * content)
 {
     kms_display_t *d = &ctx->displays[disp];
     bool target_framebuffer = false;
+    bool is_top = true;
 
     if (!is_display_connected(ctx, disp))
         return 0;
 
+    ALOGI_IF(DEBUG_ST_HWCOMPOSER, "PREPARE (%d layers)", content->numHwLayers);
+
     for (int i = content->numHwLayers - 1; i >= 0; i--) {
         hwc_layer_1_t & layer = content->hwLayers[i];
         private_handle_t *hnd = (private_handle_t *) layer.handle;
+
+        dump_layer(&layer, (int) i);
 
         if (layer.flags & HWC_SKIP_LAYER)
             continue;
@@ -858,15 +1039,26 @@ prepare_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * conten
 
         if (target_framebuffer) {
             layer.compositionType = HWC_FRAMEBUFFER;
+            is_top = false;
+            continue;
+        }
+
+        if (d->cursor.support && is_top &&
+                ((layer.displayFrame.right - layer.displayFrame.left) < MAX_SIZE_CURSOR) &&
+                ((layer.displayFrame.bottom - layer.displayFrame.top) < MAX_SIZE_CURSOR)) {
+            layer.compositionType = HWC_CURSOR_OVERLAY;
+            is_top = false;
             continue;
         }
 
         if (find_plane(ctx, disp, hnd)) {
             layer.compositionType = HWC_OVERLAY;
+            is_top = false;
             continue;
         }
 
         layer.compositionType = HWC_FRAMEBUFFER;
+        is_top = false;
         target_framebuffer = true;
     }
 

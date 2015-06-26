@@ -58,6 +58,8 @@
 #define FENCE_NEW_BUF 2
 
 #define MAX_DRM_PLANES 10
+#define COMPO_INDEX    -1       /* virtual plane index for compo */
+#define CURSOR_INDEX   -2       /* virtual plane index for cursor */
 
 typedef struct fb_info
 {
@@ -73,13 +75,27 @@ typedef struct fb_status
     fb_info_t next;
 } fb_status_t;
 
+typedef struct cursor_info
+{
+    int share_fd;               /* dmabuf fd */
+    uint32_t bo_handle;         /* KMS buffer object handle */
+    bool updated;               /* True if the cursor information has been updated */
+} cursor_info_t;
+
+typedef struct cursor_status
+{
+    cursor_info_t current;
+    cursor_info_t next;
+    bool support;
+} cursor_status_t;
+
+#if DEBUG_ST_HWCOMPOSER_FENCE
 enum
 {
     PT_FREE,
     PT_PENDING
 };
 
-#if DEBUG_ST_HWCOMPOSER_FENCE
 typedef struct timeline_dbg
 {
     int status;
@@ -113,10 +129,12 @@ typedef struct kms_display
     /* sync */
     timeline_info_t retire_sync;
     timeline_info_t release_sync[MAX_DRM_PLANES];
+    timeline_info_t release_sync_cursor;
 
-    /* fb info */
+    /* fb and cursor info */
     fb_status_t fb_main;
     fb_status_t fb_plane[MAX_DRM_PLANES];
+    cursor_status_t cursor;
 
     bool compo_updated;
 } kms_display_t;
