@@ -710,7 +710,7 @@ set_cursor_info(cursor_info_t * cursor_info, uint32_t bo, int fd, bool updated)
 static int
 update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display)
 {
-    int ret, zorder = 1, drm_plane_id, plane_index;
+    int ret, zorder = 2, drm_plane_id, plane_index;
     uint32_t fb, bo[4] = { 0 };
     uint64_t used_planes = 0;
     bool used_cursor = false;
@@ -786,8 +786,6 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
 
                 ALOGI_IF(DEBUG_ST_HWCOMPOSER, "  Called drmModeSetCrtc (%s buffer)",
                         is_fb_updated ? "updated" : "unchanged");
-
-                zorder++;
 
                 /* Update status */
                 set_fb_info(&fb_status->next, fb, bo[0], hnd->share_fd, is_fb_updated);
