@@ -19,6 +19,7 @@
 #include <hardware/gralloc.h>
 #include <hardware/hardware.h>
 #include <hardware/hwcomposer.h>
+#include <utils/Mutex.h>
 
 #include <EGL/egl.h>
 #include <sync/sync.h>
@@ -137,6 +138,8 @@ typedef struct kms_display
     cursor_status_t cursor;
 
     bool compo_updated;
+
+    android::Mutex compo_lock;    /* protect compo info of this struct */
 } kms_display_t;
 
 typedef struct hwc_context

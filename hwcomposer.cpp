@@ -283,6 +283,7 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, 
 {
     (void) fd, frame;
     kms_display_t *kdisp = (kms_display_t *) data;
+    android::Mutex::Autolock lock(kdisp->compo_lock);
     const hwc_procs_t *procs = kdisp->ctx->cb_procs;
     int i;
     fb_status_t *fb_status;
@@ -709,6 +710,7 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
     cursor_status_t *cursor_status;
     bool is_fb_updated, is_cursor_updated;
     kms_display_t *kdisp = &ctx->displays[disp];
+    android::Mutex::Autolock lock(kdisp->compo_lock);
 
     if (!is_display_connected(ctx, disp))
         return 0;
