@@ -699,7 +699,7 @@ set_cursor_info(cursor_info_t * cursor_info, uint32_t bo, int fd)
 }
 
 static int
-update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display)
+update_display_locked(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display)
 {
     int ret, zorder = 2, drm_plane_id, plane_index;
     uint32_t fb, bo[4] = { 0 };
@@ -924,6 +924,23 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
     kdisp->compo_updated = true;
 
     return 0;
+}
+
+static int
+update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display)
+{
+    kms_display_t *kdisp = &ctx->displays[disp];
+
+    if (kdisp->compo_updated) {
+        /* wait 20 ms */
+        ALOGI_IF(DEBUG_ST_HWCOMPOSER, "Pending job, wait for completion");
+        usleep(20000);
+
+        if (kdisp->compo_updated)
+            ALOGW("Job still pending (too long)");
+    }
+
+    return update_display_locked(ctx, disp, display);
 }
 
 static int
