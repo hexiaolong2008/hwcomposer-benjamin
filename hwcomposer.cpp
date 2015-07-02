@@ -304,12 +304,9 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, 
     for (i = 0; i < MAX_DRM_PLANES; i++) {
         fb_status = &kdisp->fb_plane[i];
         if (fb_status->next.updated) {
-            if (fb_status->current.drm_fb_id == fb_status->next.drm_fb_id)
-                /* shall not happen, but more secure to check */
-                continue;
-
             /* The buffer actually changed: increment timeline */
             signal_fence(&kdisp->release_sync[i], i);
+
             release_drm_fb(kdisp->ctx->drm_fd, &fb_status->current);
 
             fb_status->next.updated = false;
@@ -320,29 +317,22 @@ vblank_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec, 
     /* For main FB : free resources */
     fb_status = &kdisp->fb_main;
     if (fb_status->next.updated) {
-        if (fb_status->current.drm_fb_id != fb_status->next.drm_fb_id) {
-            /* shall always be true, but more secure to check */
-            release_drm_fb(kdisp->ctx->drm_fd, &fb_status->current);
+        release_drm_fb(kdisp->ctx->drm_fd, &fb_status->current);
 
-            fb_status->next.updated = false;
-            fb_status->current = fb_status->next;
-        }
+        fb_status->next.updated = false;
+        fb_status->current = fb_status->next;
     }
 
     /* For cursor: signal the release_fences and free resources */
     cursor_status = &kdisp->cursor;
     if (cursor_status->next.updated) {
-        if (cursor_status->current.bo_handle != cursor_status->next.bo_handle) {
-            /* shall always be true, but more secure to check */
+        /* The buffer actually changed: increment timeline */
+        signal_fence(&kdisp->release_sync_cursor, CURSOR_INDEX);
 
-            /* The buffer actually changed: increment timeline */
-            signal_fence(&kdisp->release_sync_cursor, CURSOR_INDEX);
+        release_drm_cursor(kdisp->ctx->drm_fd, &cursor_status->current);
 
-            release_drm_cursor(kdisp->ctx->drm_fd, &cursor_status->current);
-
-            cursor_status->next.updated = false;
-            cursor_status->current = cursor_status->next;
-        }
+        cursor_status->next.updated = false;
+        cursor_status->current = cursor_status->next;
     }
 
     /* Signal retireFence */
@@ -691,20 +681,20 @@ create_drm_fb(hwc_context_t * ctx, private_handle_t const *hnd, uint32_t * fb, u
 }
 
 static void
-set_fb_info(fb_info_t * fb_info, uint32_t fb_id, uint32_t bo, int fd, bool updated)
+set_fb_info(fb_info_t * fb_info, uint32_t fb_id, uint32_t bo, int fd)
 {
     fb_info->drm_fb_id = fb_id;
     fb_info->bo_handle = bo;
     fb_info->share_fd = fd;
-    fb_info->updated = updated;
+    fb_info->updated = true;
 }
 
 static void
-set_cursor_info(cursor_info_t * cursor_info, uint32_t bo, int fd, bool updated)
+set_cursor_info(cursor_info_t * cursor_info, uint32_t bo, int fd)
 {
     cursor_info->bo_handle = bo;
     cursor_info->share_fd = fd;
-    cursor_info->updated = updated;
+    cursor_info->updated = true;
 }
 
 static int
@@ -788,7 +778,8 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
                         is_fb_updated ? "updated" : "unchanged");
 
                 /* Update status */
-                set_fb_info(&fb_status->next, fb, bo[0], hnd->share_fd, is_fb_updated);
+                if (is_fb_updated)
+                    set_fb_info(&fb_status->next, fb, bo[0], hnd->share_fd);
 
                 break;
 
@@ -835,7 +826,8 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
                             is_fb_updated ? FENCE_NEW_BUF : FENCE_CURRENT_BUF, plane_index);
 
                 /* Update status */
-                set_fb_info(&fb_status->next, fb, bo[0], hnd->share_fd, is_fb_updated);
+                if (is_fb_updated)
+                    set_fb_info(&fb_status->next, fb, bo[0], hnd->share_fd);
 
                 break;
 
@@ -857,8 +849,6 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
                         ALOGE("Failed to set cursor %s", strerror(errno));
                         return ret;
                     }
-                } else {
-                    bo[0] = cursor_status->current.bo_handle;
                 }
 
                 /* Update display */
@@ -880,7 +870,8 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
                             is_cursor_updated ? FENCE_NEW_BUF : FENCE_CURRENT_BUF, CURSOR_INDEX);
 
                 /* Update status */
-                set_cursor_info(&cursor_status->next, bo[0], hnd->share_fd, is_cursor_updated);
+                if (is_cursor_updated)
+                    set_cursor_info(&cursor_status->next, bo[0], hnd->share_fd);
 
                 break;
 
@@ -904,7 +895,7 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
             }
 
             /* Update status */
-            set_fb_info(&fb_status->next, 0, 0, 0, true);
+            set_fb_info(&fb_status->next, 0, 0, 0);
         }
         used_planes >>= 1;
     }
@@ -922,7 +913,7 @@ update_display(hwc_context_t * ctx, int disp, hwc_display_contents_1_t * display
         }
 
         /* Update status */
-        set_cursor_info(&cursor_status->next, 0, 0, true);
+        set_cursor_info(&cursor_status->next, 0, 0);
     }
 
     if (display->retireFenceFd == -1)
