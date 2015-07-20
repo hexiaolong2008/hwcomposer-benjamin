@@ -27,7 +27,7 @@ LOCAL_MODULE := hwcomposer.$(TARGET_BOARD_PLATFORM)
 LOCAL_CFLAGS:= -DLOG_TAG=\"hwcomposer\"
 LOCAL_MODULE_TAGS := eng
 LOCAL_C_INCLUDES += \
-        $(TOP)/hardware/libhardware/modules/gralloc \
+        $(TOP)/${GRALLOC_PATH} \
         $(TOP)/external/drm \
         $(TOP)/external/drm/include/drm \
         $(TOP)/hardware/libhardware/include \
